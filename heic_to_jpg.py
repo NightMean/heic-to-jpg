@@ -3,12 +3,14 @@ import sys
 import io
 import argparse
 import pillow_heif
+import pyexiv2
+import unicodedata
 from pathlib import Path
 from PIL import Image, ImageCms
 from pillow_heif import read_heif
-import pyexiv2
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+from argparse import RawTextHelpFormatter
 
 # Function to set up logging
 def setup_logging(verbose, log_file, use_tqdm):
