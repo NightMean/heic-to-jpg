@@ -1,3 +1,11 @@
+# Version 1.0
+
+# Pip package versions used during testing:
+# pyexiv2==2.12.0
+# pillow_heif==0.16.0
+# pillow==10.4.0
+# tqdm==4.65.0
+
 import logging
 import sys
 import io
@@ -31,7 +39,7 @@ def setup_logging(verbose, log_file, use_tqdm):
         console_handler = TqdmLoggingHandler(sys.stdout)
     else:
         console_handler = logging.StreamHandler(sys.stdout)
-
+    
     console_handler.setLevel(logging.INFO if verbose else logging.WARNING)
     console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(console_formatter)
@@ -83,7 +91,6 @@ def process_exif_data(image, heif_path, file_name):
         heif_metadata = pyexiv2.Image(str(heif_path))
         exif_data = heif_metadata.read_exif()
         heif_metadata.close()
-
         orientation = int(exif_data.get("Exif.Image.Orientation", 1))
         image = rotate_image(image, orientation)
         exif_data["Exif.Image.Orientation"] = '1'  # Reset orientation to 'Horizontal (normal)'
@@ -125,10 +132,14 @@ def handle_output_directory(output_dir, preserve_structure, input_dir, heif_path
     if preserve_structure and input_dir:
         relative_path = heif_path.relative_to(input_dir)
         output_subdir = output_dir / relative_path.parent
-        output_subdir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created directory: {output_subdir}")
+        if not output_subdir.exists():
+            output_subdir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created directory: {output_subdir}")
     else:
         output_subdir = output_dir
+        if not output_subdir.exists():
+            output_subdir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created directory: {output_subdir}")
     return output_subdir
 
 # Function to normalize filenames by removing special characters
@@ -158,7 +169,6 @@ def rename_files(files):
         normalized_files.append(normalized_path)
     return normalized_files
 
-
 # Main conversion function
 def convert_heif_to_jpg(heif_path, output_dir, quality, delete_original, preserve_structure=False, input_dir=None, index=None, total=None):
     file_name = Path(heif_path).name
@@ -166,8 +176,9 @@ def convert_heif_to_jpg(heif_path, output_dir, quality, delete_original, preserv
         logging.info(f"Processing file {index} of {total}: {heif_path}")
     logging.info(f"Converting {heif_path} to JPEG with quality={quality}")
     try:
+        # Required to enable HEIC/HEIF support by pyexiv2
         pyexiv2.enableBMFF()
-
+        
         image, heif_file = read_heif_file(heif_path)
         image = apply_icc_profile(image, heif_file, file_name)
         image, exif_data = process_exif_data(image, heif_path, file_name)
@@ -180,7 +191,6 @@ def convert_heif_to_jpg(heif_path, output_dir, quality, delete_original, preserv
             return None
 
         write_exif_data_to_jpeg(jpg_path, exif_data, file_name)
-
         logging.info(f"Successfully converted {heif_path} to JPEG: {jpg_path}")
 
         if delete_original:
@@ -201,34 +211,29 @@ def convert_heif_to_jpg(heif_path, output_dir, quality, delete_original, preserv
         logging.exception(f"Failed to convert {file_name} to JPEG due to unexpected error: {e}")
         return None
 
-
 def find_heif_files(directory, recursive):
     if recursive:
-        return list(directory.rglob('*.heic')) + list(directory.rglob('*.heif'))
+        return [f for f in directory.rglob('*') if f.suffix.lower() in ['.heic', '.heif']]
     else:
-        return list(directory.glob('*.heic')) + list(directory.glob('*.heif'))
+        return [f for f in directory.glob('*') if f.suffix.lower() in ['.heic', '.heif']]
 
 def process_images(heif_files, output_dir, quality, delete_original, preserve_structure, input_dir, workers, show_progress):
     total_files = len(heif_files)
     progress_bar = tqdm(total=total_files, desc="Converting", unit="file") if show_progress else None
-    batch_size = max(1, total_files // (workers * 2))  # Adjust batch size based on number of workers and files
 
-    def batch_convert(batch):
-        for heif_path in batch:
-            convert_heif_to_jpg(heif_path, output_dir, quality, delete_original, preserve_structure, input_dir)
-            if progress_bar:
-                progress_bar.update(1)
+    def convert_wrapper(file_path, index):
+        logging.info(f"Processing file {index + 1} of {total_files}: {file_path}")
+        convert_heif_to_jpg(file_path, output_dir, quality, delete_original, preserve_structure, input_dir)
+        if progress_bar:
+            progress_bar.update(1)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(batch_convert, heif_files[i:i + batch_size])
-            for i in range(0, total_files, batch_size)
-        ]
+        futures = {executor.submit(convert_wrapper, heif_files[i], i): i for i in range(total_files)}
         for future in as_completed(futures):
             try:
                 future.result()
             except Exception as e:
-                logging.error(f"Error occurred during batch processing: {e}")
+                logging.error(f"Error occurred during file processing: {e}")
 
     if progress_bar:
         progress_bar.close()
@@ -257,31 +262,29 @@ def main():
                         help="The directory containing HEIF/HEIC files to convert. Default is the current working directory.")
     parser.add_argument('-o', '--output', type=str, default=Path.cwd(),
                         help="The directory to save the converted JPEG files. Default is the current working directory.")
-    parser.add_argument('-r', '--recursive', action='store_true',
+    parser.add_argument('-r', '--recursive', action='store_true', 
                         help="Convert files in subdirectories recursively.")
     parser.add_argument('-q', '--quality', type=int, default=95,
                         help="The quality of the converted JPEG files (1-100). Default is 95%%.")
-    parser.add_argument('-y', '--yes', action='store_true',
+    parser.add_argument('-y', '--yes', action='store_true', 
                         help="Suppress the confirmation prompt if no input directory is specified.")
-    parser.add_argument('-v', '--verbose', action='store_true',
+    parser.add_argument('-v', '--verbose', action='store_true', 
                         help="Enable verbose logging.")
-    parser.add_argument('-l', '--log', type=str,
-                        help="Save log output to the specified file.")
-    parser.add_argument('--delete', action='store_true',
+    parser.add_argument('-l', '--log', type=str, 
+                        help="Save log output to the specified file. \nLog should be used as last argument")
+    parser.add_argument('--delete', action='store_true', 
                         help="Automatically delete original HEIF/HEIC files after conversion.")
     parser.add_argument('-p', '--preserve-structure', action='store_true',
                         help="Preserve directory structure by creating subdirectories in the output folder for each \nsubdirectory found in the input folder. Only works with -r or --recursive.")
     parser.add_argument('-w', '--workers', type=int, default=4,
                         help="Number of threads to process images concurrently. Default is 4.")
-    parser.add_argument('--progress', action='store_true',
+    parser.add_argument('--progress', action='store_true', 
                         help="Show a progress bar for the conversion process.")
     parser.add_argument('-c', '--character-normalization', action='store_true',
                         help="Normalize filenames by replacing special characters.\n\nWARNING: Files will be renamed only if their filenames are altered during normalization.\nIf a file with the same normalized name already exists in the input directory, it will be\nrenamed with a '_renamed_1', '_renamed_2', etc. suffix.")
 
     args = parser.parse_args()
-
     use_tqdm = args.progress
-
     setup_logging(args.verbose, args.log, use_tqdm)
 
     if args.preserve_structure and not args.recursive:
@@ -295,15 +298,14 @@ def main():
         logging.error("Quality must be between 1 and 100.")
         return
 
-    if not args.dir and not args.yes:
+    if not args.dir and not args.yes:   
         confirm = input(f"No argument for input directory specified. \nContinue in the current directory ({input_dir})? [y/N]: ")
         if confirm.lower() != 'y':
             logging.info("Operation cancelled by the user.")
             return
-    # If not in an interactive session, assume 'yes' silently
 
     logging.info(f"No argument for quality specified, using default (95%%)" if args.quality == 95 else f"Using specified quality={args.quality}%")
-    logging.info(f"Script started with input directory: {input_dir}, output directory: {output_dir}, recursive={args.recursive}, and workers={args.workers}")
+    logging.info(f"HEIC to JPG script started with input directory: {input_dir}, output directory: {output_dir}, recursive={args.recursive}, and workers={args.workers}")
 
     convert_all_heif_to_jpg(input_dir, output_dir, args.recursive, args.quality, args.delete, args.preserve_structure, args.workers, args.progress, args.character_normalization)
 
