@@ -1,5 +1,3 @@
-# Version 1.0
-
 import logging
 import sys
 import io
@@ -10,14 +8,28 @@ from PIL import Image, ImageCms
 from pillow_heif import read_heif
 import pyexiv2
 from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 
 # Function to set up logging
-def setup_logging(verbose, log_file):
+def setup_logging(verbose, log_file, use_tqdm):
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)  # Set to the lowest level to ensure all messages are processed
 
+    class TqdmLoggingHandler(logging.StreamHandler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                tqdm.write(msg)
+                self.flush()
+            except Exception:
+                self.handleError(record)
+
     # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
+    if use_tqdm:
+        console_handler = TqdmLoggingHandler(sys.stdout)
+    else:
+        console_handler = logging.StreamHandler(sys.stdout)
+
     console_handler.setLevel(logging.INFO if verbose else logging.WARNING)
     console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(console_formatter)
@@ -31,8 +43,7 @@ def setup_logging(verbose, log_file):
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
 
-# Needed function to properly rotate the image upon conversion
-
+# Function to properly rotate the image upon conversion
 def rotate_image(image, orientation):
     """Rotate image according to the EXIF orientation."""
     if orientation in (1, 2, 3, 4, 5, 6, 7, 8):
@@ -40,82 +51,105 @@ def rotate_image(image, orientation):
     else:
         return image
 
+# Function to read HEIF file and convert to PIL Image
+def read_heif_file(heif_path):
+    heif_file = pillow_heif.read_heif(heif_path)
+    image = Image.frombytes(
+        heif_file.mode,
+        heif_file.size,
+        heif_file.data,
+        "raw",
+        heif_file.mode,
+        heif_file.stride,
+    )
+    return image, heif_file
+
+# Function to apply ICC profile to image
+def apply_icc_profile(image, heif_file, file_name):
+    icc_profile = heif_file.info.get('icc_profile')
+    if (icc_profile):
+        icc_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_profile))
+        image.info['icc_profile'] = icc_profile.tobytes()
+        logging.info(f"ICC profile extracted and applied to {file_name}")
+    else:
+        logging.warning(f"No ICC profile found in {file_name}")
+    return image
+
+# Function to read EXIF metadata and rotate image
+def process_exif_data(image, heif_path, file_name):
+    try:
+        heif_metadata = pyexiv2.Image(str(heif_path))
+        exif_data = heif_metadata.read_exif()
+        heif_metadata.close()
+
+        orientation = int(exif_data.get("Exif.Image.Orientation", 1))
+        image = rotate_image(image, orientation)
+        exif_data["Exif.Image.Orientation"] = '1'  # Reset orientation to 'Horizontal (normal)'
+    except RuntimeError as e:
+        if "XMP Toolkit error 201" in str(e):
+            logging.warning(f"No EXIF metadata found in {file_name}")
+        elif "Failed to open the data source" in str(e):
+            logging.error(f"Error reading EXIF metadata from {file_name}: The file name contains special characters. Please rename the file and try again.")
+            exif_data = {}
+        else:
+            logging.warning(f"Error reading EXIF metadata from {file_name}: {e}")
+            exif_data = {}
+    return image, exif_data
+
+# Function to save image as JPEG in 4:4:4 Subsampling
+def save_image_as_jpeg(image, jpg_path, quality, file_name):
+    try:
+        image.convert("YCbCr").save(jpg_path, "JPEG", quality=quality, subsampling=0, icc_profile=image.info.get('icc_profile'))
+    except Exception as e:
+        logging.error(f"Failed to save JPEG file: {jpg_path}. Error: {e}")
+        return False
+    return True
+
+# Function to write EXIF data to JPEG
+def write_exif_data_to_jpeg(jpg_path, exif_data, file_name):
+    try:
+        if exif_data:
+            jpg_metadata = pyexiv2.Image(str(jpg_path))
+            jpg_metadata.modify_exif(exif_data)
+            jpg_metadata.close()
+            logging.info(f"EXIF metadata successfully written to {jpg_path}")
+        else:
+            logging.warning(f"No EXIF data to write to {jpg_path}")
+    except RuntimeError as e:
+        logging.warning(f"Failed to write EXIF metadata to {jpg_path}: {e}")
+
+# Function to handle output directory creation
+def handle_output_directory(output_dir, preserve_structure, input_dir, heif_path):
+    if preserve_structure and input_dir:
+        relative_path = heif_path.relative_to(input_dir)
+        output_subdir = output_dir / relative_path.parent
+        output_subdir.mkdir(parents=True, exist_ok=True)
+        logging.info(f"Created directory: {output_subdir}")
+    else:
+        output_subdir = output_dir
+    return output_subdir
+
+# Main conversion function
 def convert_heif_to_jpg(heif_path, output_dir, quality, delete_original, preserve_structure=False, input_dir=None, index=None, total=None):
     file_name = Path(heif_path).name
     if index is not None and total is not None:
         logging.info(f"Processing file {index} of {total}: {heif_path}")
     logging.info(f"Converting {heif_path} to JPEG with quality={quality}")
     try:
-        # Enable BMFF (HEIC/HEIF) support by pyexiv2 library
         pyexiv2.enableBMFF()
 
-        heif_file = pillow_heif.read_heif(heif_path)
-
-        image = Image.frombytes(
-            heif_file.mode,
-            heif_file.size,
-            heif_file.data,
-            "raw",
-            heif_file.mode,
-            heif_file.stride,
-        )
-
-        icc_profile = heif_file.info.get('icc_profile')
-        if icc_profile:
-            icc_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_profile))
-            image.info['icc_profile'] = icc_profile.tobytes()
-            logging.info(f"ICC profile extracted and applied to {file_name}")
-        else:
-            logging.warning(f"No ICC profile found in {file_name}")
-
+        image, heif_file = read_heif_file(heif_path)
+        image = apply_icc_profile(image, heif_file, file_name)
+        image, exif_data = process_exif_data(image, heif_path, file_name)
         image = image.convert("RGB")
 
-        try:
-            heif_metadata = pyexiv2.Image(str(heif_path))
-            exif_data = heif_metadata.read_exif()
-            heif_metadata.close()
-
-            orientation = int(exif_data.get("Exif.Image.Orientation", 1))
-            image = rotate_image(image, orientation)
-            exif_data["Exif.Image.Orientation"] = '1'  # Reset orientation to 'Horizontal (normal)'
-        except RuntimeError as e:
-            if "XMP Toolkit error 201" in str(e):
-                logging.warning(f"No EXIF metadata found in {file_name}")
-            elif "Failed to open the data source: No such file or directory (errno = 2)" in str(e):
-                logging.error(f"Error reading EXIF metadata from {file_name}: The file name contains special characters. Please rename the file and try again.")
-                exif_data = {}
-            else:
-                logging.warning(f"Error reading EXIF metadata from {file_name}: {e}")
-                exif_data = {}
-
-        if preserve_structure and input_dir:
-            # Create the same directory structure in the output directory
-            relative_path = heif_path.relative_to(input_dir)
-            output_subdir = output_dir / relative_path.parent
-            output_subdir.mkdir(parents=True, exist_ok=True)
-            logging.info(f"Created directory: {output_subdir}")
-        else:
-            output_subdir = output_dir
-
+        output_subdir = handle_output_directory(output_dir, preserve_structure, input_dir, heif_path)
         jpg_path = output_subdir / Path(heif_path).with_suffix('.jpg').name
 
-        # Ensure no subsampling is applied
-        try:
-            image.convert("YCbCr").save(jpg_path, "JPEG", quality=quality, subsampling=0, icc_profile=image.info.get('icc_profile'))
-        except Exception as e:
-            logging.error(f"Failed to save JPEG file: {jpg_path}. Error: {e}")
+        if not save_image_as_jpeg(image, jpg_path, quality, file_name):
             return None
 
-        try:
-            if exif_data:
-                jpg_metadata = pyexiv2.Image(str(jpg_path))
-                jpg_metadata.modify_exif(exif_data)
-                jpg_metadata.close()
-                logging.info(f"EXIF metadata successfully written to {jpg_path}")
-            else:
-                logging.warning(f"No EXIF data to write to {jpg_path}")
-        except RuntimeError as e:
-            logging.warning(f"Failed to write EXIF metadata to {jpg_path}: {e}")
+        write_exif_data_to_jpeg(jpg_path, exif_data, file_name)
 
         logging.info(f"Successfully converted {heif_path} to JPEG: {jpg_path}")
 
@@ -143,8 +177,9 @@ def find_heif_files(directory, recursive):
     else:
         return [p for p in directory.glob('*') if p.suffix.lower() in ['.heif', '.heic']]
 
-def process_images(heif_files, output_dir, quality, delete_original, preserve_structure, input_dir, workers):
+def process_images(heif_files, output_dir, quality, delete_original, preserve_structure, input_dir, workers, show_progress):
     total_files = len(heif_files)
+    progress_bar = tqdm(total=total_files, desc="Converting", unit="file") if show_progress else None
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
             executor.submit(convert_heif_to_jpg, heif_path, output_dir, quality, delete_original, preserve_structure, input_dir, index + 1, total_files)
@@ -152,8 +187,12 @@ def process_images(heif_files, output_dir, quality, delete_original, preserve_st
         ]
         for future in futures:
             future.result()  # Wait for all futures to complete
+            if progress_bar:
+                progress_bar.update(1)
+    if progress_bar:
+        progress_bar.close()
 
-def convert_all_heif_to_jpg(input_dir, output_dir, recursive, quality, delete_original, preserve_structure, workers):
+def convert_all_heif_to_jpg(input_dir, output_dir, recursive, quality, delete_original, preserve_structure, workers, show_progress):
     logging.info(f"Starting conversion in directory: {input_dir} with recursive={recursive}")
     input_dir = Path(input_dir)
     if not input_dir.is_dir():
@@ -165,7 +204,7 @@ def convert_all_heif_to_jpg(input_dir, output_dir, recursive, quality, delete_or
         logging.info(f"No HEIF/HEIC files found in directory: {input_dir}")
         return
 
-    process_images(heif_files, output_dir, quality, delete_original, preserve_structure, input_dir, workers)
+    process_images(heif_files, output_dir, quality, delete_original, preserve_structure, input_dir, workers, show_progress)
     logging.info("Conversion process complete.")
 
 def main():
@@ -190,10 +229,14 @@ def main():
                         help="Preserve directory structure by creating subdirectories in the output folder for each subdirectory found in the input folder. Only works with -r or --recursive.")
     parser.add_argument('-w', '--workers', type=int, default=4,
                         help="Number of threads to process images concurrently. Default is 4.")
+    parser.add_argument('--progress', action='store_true',
+                        help="Show a progress bar for the conversion process.")
 
     args = parser.parse_args()
 
-    setup_logging(args.verbose, args.log)
+    use_tqdm = args.progress
+
+    setup_logging(args.verbose, args.log, use_tqdm)
 
     if args.preserve_structure and not args.recursive:
         logging.error("The --preserve-structure argument can only be used with -r or --recursive.")
@@ -207,15 +250,16 @@ def main():
         return
 
     if not args.dir and not args.yes:
-        confirm = input(f"No input directory specified. Continue in the current directory ({input_dir})? [y/N]: ")
+        confirm = input(f"No argument for input directory specified. \nContinue in the current directory ({input_dir})? [y/N]: ")
         if confirm.lower() != 'y':
             logging.info("Operation cancelled by the user.")
             return
+    # If not in an interactive session, assume 'yes' silently
 
     logging.info(f"No argument for quality specified, using default (95%%)" if args.quality == 95 else f"Using specified quality={args.quality}%")
     logging.info(f"Script started with input directory: {input_dir}, output directory: {output_dir}, recursive={args.recursive}, and workers={args.workers}")
 
-    convert_all_heif_to_jpg(input_dir, output_dir, args.recursive, args.quality, args.delete, args.preserve_structure, args.workers)
+    convert_all_heif_to_jpg(input_dir, output_dir, args.recursive, args.quality, args.delete, args.preserve_structure, args.workers, args.progress)
 
 if __name__ == '__main__':
     main()
