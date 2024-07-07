@@ -131,6 +131,34 @@ def handle_output_directory(output_dir, preserve_structure, input_dir, heif_path
         output_subdir = output_dir
     return output_subdir
 
+# Function to normalize filenames by removing special characters
+def normalize_filename(file_path):
+    normalized_name = unicodedata.normalize('NFKD', file_path.stem).encode('ascii', 'ignore').decode('ascii')
+    normalized_path = file_path.with_name(normalized_name + file_path.suffix)
+    return normalized_path
+
+# Function to rename files to normalized names
+def rename_files(files):
+    normalized_files = []
+    for file_path in files:
+        normalized_path = normalize_filename(file_path)
+        if normalized_path != file_path:
+            # Check if the normalized path already exists
+            if normalized_path.exists():
+                # Find a unique name
+                counter = 1
+                while True:
+                    new_name = f"{normalized_path.stem}_renamed_{counter}{normalized_path.suffix}"
+                    new_path = normalized_path.with_name(new_name)
+                    if not new_path.exists():
+                        normalized_path = new_path
+                        break
+                    counter += 1
+            file_path.rename(normalized_path)
+        normalized_files.append(normalized_path)
+    return normalized_files
+
+
 # Main conversion function
 def convert_heif_to_jpg(heif_path, output_dir, quality, delete_original, preserve_structure=False, input_dir=None, index=None, total=None):
     file_name = Path(heif_path).name
@@ -173,28 +201,39 @@ def convert_heif_to_jpg(heif_path, output_dir, quality, delete_original, preserv
         logging.exception(f"Failed to convert {file_name} to JPEG due to unexpected error: {e}")
         return None
 
+
 def find_heif_files(directory, recursive):
     if recursive:
-        return [p for p in directory.rglob('*') if p.suffix.lower() in ['.heif', '.heic']]
+        return list(directory.rglob('*.heic')) + list(directory.rglob('*.heif'))
     else:
-        return [p for p in directory.glob('*') if p.suffix.lower() in ['.heif', '.heic']]
+        return list(directory.glob('*.heic')) + list(directory.glob('*.heif'))
 
 def process_images(heif_files, output_dir, quality, delete_original, preserve_structure, input_dir, workers, show_progress):
     total_files = len(heif_files)
     progress_bar = tqdm(total=total_files, desc="Converting", unit="file") if show_progress else None
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(convert_heif_to_jpg, heif_path, output_dir, quality, delete_original, preserve_structure, input_dir, index + 1, total_files)
-            for index, heif_path in enumerate(heif_files)
-        ]
-        for future in futures:
-            future.result()  # Wait for all futures to complete
+    batch_size = max(1, total_files // (workers * 2))  # Adjust batch size based on number of workers and files
+
+    def batch_convert(batch):
+        for heif_path in batch:
+            convert_heif_to_jpg(heif_path, output_dir, quality, delete_original, preserve_structure, input_dir)
             if progress_bar:
                 progress_bar.update(1)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(batch_convert, heif_files[i:i + batch_size])
+            for i in range(0, total_files, batch_size)
+        ]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"Error occurred during batch processing: {e}")
+
     if progress_bar:
         progress_bar.close()
 
-def convert_all_heif_to_jpg(input_dir, output_dir, recursive, quality, delete_original, preserve_structure, workers, show_progress):
+def convert_all_heif_to_jpg(input_dir, output_dir, recursive, quality, delete_original, preserve_structure, workers, show_progress, char_norm):
     logging.info(f"Starting conversion in directory: {input_dir} with recursive={recursive}")
     input_dir = Path(input_dir)
     if not input_dir.is_dir():
@@ -206,11 +245,14 @@ def convert_all_heif_to_jpg(input_dir, output_dir, recursive, quality, delete_or
         logging.info(f"No HEIF/HEIC files found in directory: {input_dir}")
         return
 
+    if char_norm:
+        heif_files = rename_files(heif_files)
+
     process_images(heif_files, output_dir, quality, delete_original, preserve_structure, input_dir, workers, show_progress)
     logging.info("Conversion process complete.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Converts HEIF/HEIC files to JPEG while preserving EXIF metadata and ICC Profile.", allow_abbrev=False)
+    parser = argparse.ArgumentParser(description="Converts HEIF/HEIC files to JPEG while preserving EXIF metadata and ICC Profile.", formatter_class=RawTextHelpFormatter, allow_abbrev=False)
     parser.add_argument('-d', '--dir', type=str, default=None,
                         help="The directory containing HEIF/HEIC files to convert. Default is the current working directory.")
     parser.add_argument('-o', '--output', type=str, default=Path.cwd(),
@@ -228,11 +270,13 @@ def main():
     parser.add_argument('--delete', action='store_true',
                         help="Automatically delete original HEIF/HEIC files after conversion.")
     parser.add_argument('-p', '--preserve-structure', action='store_true',
-                        help="Preserve directory structure by creating subdirectories in the output folder for each subdirectory found in the input folder. Only works with -r or --recursive.")
+                        help="Preserve directory structure by creating subdirectories in the output folder for each \nsubdirectory found in the input folder. Only works with -r or --recursive.")
     parser.add_argument('-w', '--workers', type=int, default=4,
                         help="Number of threads to process images concurrently. Default is 4.")
     parser.add_argument('--progress', action='store_true',
                         help="Show a progress bar for the conversion process.")
+    parser.add_argument('-c', '--character-normalization', action='store_true',
+                        help="Normalize filenames by replacing special characters.\n\nWARNING: Files will be renamed only if their filenames are altered during normalization.\nIf a file with the same normalized name already exists in the input directory, it will be\nrenamed with a '_renamed_1', '_renamed_2', etc. suffix.")
 
     args = parser.parse_args()
 
@@ -261,7 +305,7 @@ def main():
     logging.info(f"No argument for quality specified, using default (95%%)" if args.quality == 95 else f"Using specified quality={args.quality}%")
     logging.info(f"Script started with input directory: {input_dir}, output directory: {output_dir}, recursive={args.recursive}, and workers={args.workers}")
 
-    convert_all_heif_to_jpg(input_dir, output_dir, args.recursive, args.quality, args.delete, args.preserve_structure, args.workers, args.progress)
+    convert_all_heif_to_jpg(input_dir, output_dir, args.recursive, args.quality, args.delete, args.preserve_structure, args.workers, args.progress, args.character_normalization)
 
 if __name__ == '__main__':
     main()
